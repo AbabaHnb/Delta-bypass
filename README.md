@@ -23,7 +23,7 @@ python main.py "<ticket>"
 python main.py tickets.txt
 ```
 
-### 2. 生成测试链接并求解
+### 2. 生成测试链接并求解(测试链接只能用来测试求解器 无任何其他用途)
 
 ```bash
 # 生成 5 条测试链接并求解
