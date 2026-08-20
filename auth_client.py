@@ -3,6 +3,7 @@
 
 import json
 import base64
+import itertools
 import time
 import urllib.parse
 import requests
@@ -12,6 +13,24 @@ from fake_useragent import UserAgent
 
 _ua = UserAgent(platforms='mobile')
 AUTH_API = "https://auth.platorelay.com/api"
+
+# fake_useragent 的 .random 每次约 16ms（内部重新筛选数据集），在高并发下是显著开销。
+# 启动时预生成一批 UA，之后 O(1) 轮转取用 —— 对外表现（UA 多样性）不变。
+_UA_POOL = []
+_UA_IDX = itertools.count()
+
+
+def _rand_ua():
+    global _UA_POOL
+    if not _UA_POOL:
+        seen = []
+        for _ in range(32):
+            try:
+                seen.append(_ua.random)
+            except Exception:
+                break
+        _UA_POOL = list(dict.fromkeys(seen)) or ['Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)']
+    return _UA_POOL[next(_UA_IDX) % len(_UA_POOL)]
 
 #AES-CTR
 
@@ -123,29 +142,30 @@ def extract_ticket_from_callback(callback_url):
 #步骤
 
 #urllib3连接池
+# 高并发：单主机连接池要够大，否则请求排队等连接（原 maxsize=1 是并发瓶颈）
 _step_pool = urllib3.PoolManager(
-    num_pools=1, maxsize=1, retries=False,
-    timeout=urllib3.Timeout(connect=2.0, read=3.0),
+    num_pools=8, maxsize=64, block=False, retries=False,
+    timeout=urllib3.Timeout(connect=3.0, read=8.0),
 )
 
 def create_session():
     #构建requests
     s = requests.Session()
     s.headers.update({
-        'User-Agent': _ua.random,
+        'User-Agent': _rand_ua(),
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/plain, */*',
     })
     #无重试
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=1, pool_maxsize=1, max_retries=0)
+        pool_connections=8, pool_maxsize=32, max_retries=0)
     s.mount('http://', adapter)
     s.mount('https://', adapter)
     return s
 
 
 def do_step(ticket, token, service=3, session=None, now_ms=None):
-    # PUT /api/session/step 
+    # PUT /api/session/step 
     meta, stream = build_meta_stream(ticket, now_ms)
     url = f"{AUTH_API}/session/step?ticket={urllib.parse.quote(ticket)}&service={service}"
 
@@ -158,7 +178,7 @@ def do_step(ticket, token, service=3, session=None, now_ms=None):
 
     try:
         r = _step_pool.request('PUT', url, body=body, headers={
-            'User-Agent': _ua.random,
+            'User-Agent': _rand_ua(),
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/plain, */*'
         })
@@ -168,22 +188,22 @@ def do_step(ticket, token, service=3, session=None, now_ms=None):
 
 
 def get_session_status(ticket, session=None):
-    # GET /api/session/status 
+    # GET /api/session/status 
     try:
         r = _step_pool.request('GET',
             f"{AUTH_API}/session/status?ticket={urllib.parse.quote(ticket)}",
-            headers={'User-Agent': _ua.random, 'Accept': 'application/json'})
+            headers={'User-Agent': _rand_ua(), 'Accept': 'application/json'})
         return json.loads(r.data)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def get_session_metadata(ticket, session=None):
-    # GET /api/session/metadata 
+    # GET /api/session/metadata 
     try:
         r = _step_pool.request('GET',
             f"{AUTH_API}/session/metadata?ticket={urllib.parse.quote(ticket)}",
-            headers={'User-Agent': _ua.random, 'Accept': 'application/json'})
+            headers={'User-Agent': _rand_ua(), 'Accept': 'application/json'})
         return json.loads(r.data)
     except Exception as e:
         return {"success": False, "error": str(e)}
