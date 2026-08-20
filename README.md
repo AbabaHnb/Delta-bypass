@@ -36,32 +36,7 @@ python main.py --generate 3 --quiet
 python main.py --generate 5 --no-auto
 ```
 
-### 3. 批量 API（推荐）
-
-```python
-from api import solve, solve_batch
-
-# 单个求解
-key = solve("https://auth.platorelay.com/a?d=...")
-print(key)
-
-# 并行批量求解（3 线程 + 自动速率限制）
-tickets = [
-    "https://auth.platorelay.com/a?d=...",
-    "https://auth.platorelay.com/a?d=...",
-]
-results = solve_batch(tickets, workers=3)
-for ticket, key in results:
-    print(f"{ticket[:30]}... -> {key}")
-```
-
-```bash
-# 命令行
-python api.py "url1" "url2" "url3" --workers 3
-python api.py --file tickets.txt --workers 5
-```
-
-### 4. 作为库使用
+### 3. 作为库使用
 
 ```python
 from captcha_solver import solve, session
