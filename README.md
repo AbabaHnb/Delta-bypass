@@ -145,7 +145,7 @@ curl "http://127.0.0.1:2233/delta?url=https://auth.platorelay.com/a?d=<ticket>"
 | `key` | 求解成功的 key；失败为 `null` |
 | `cached` | `true` = 命中 24h 缓存，直接返回，未重新求解 |
 | `error` | 失败原因，成功为 `null` |
-| `times` | **真实求解耗时**，不是请求墙钟时间。缓存命中时返回当初求解的耗时 |
+| `times` | **真实求解耗时**，缓存命中时返回当初求解的耗时 |
 
 可能的 `error` 值：
 
