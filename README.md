@@ -6,6 +6,16 @@
 
 ---
 
+## 最近更改
+
+- **无效/过期链接快速拦截** — 形如 `?d=xxxxxxxxxxx……` 的链接直接返回 `error: 无效链接: invalid payload.`（约 1.2s）不再浪费服务器资源
+
+- **非等待耗时2.27s → 1.7s（约 −25%）** — 验证码全链只解一次metadata/status/captcha 三者并行metadata 合并为一次调用step与poll重叠captcha session复用
+
+当前单条求解平均约为6.8s 其中5.0s是上游强制的checkpoint间隔（不可压缩）非等待部分已接近物理下限（约 1.15s，受 6 次网络往返约束）
+
+---
+
 ## 快速开始
 
 要求 Python 3.10+。
@@ -14,7 +24,7 @@
 # 1. 安装依赖
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 
-# 2. 求解一条链接
+# 2. 求解一条链接（CLI）
 ./venv/bin/python main.py "https://auth.platorelay.com/a?d=<ticket>"
 
 # 3. 部署 API 服务
@@ -23,7 +33,7 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 
 ---
 
-## 使用方法
+## 使用方法（CLI）
 
 ### 直接求解已有 ticket
 
@@ -38,7 +48,7 @@ python main.py "<ticket>"
 python main.py tickets.txt
 ```
 
-### 生成测试链接并求解(测试链接只能用来测试求解器 无任何其他用途)
+### 生成测试链接并求解
 
 ```bash
 # 生成 5 条测试链接并求解
@@ -131,7 +141,7 @@ curl "http://127.0.0.1:2233/delta?url=https://auth.platorelay.com/a?d=<ticket>"
 
 ```json
 {
-  "key": "FREE_8d4d157d3a1dae339ba822a61840e7d5",
+  "key": "FREE_xxxxxxxxxx……",
   "cached": false,
   "error": null,
   "made_by": "Hasl_Team",
@@ -145,7 +155,7 @@ curl "http://127.0.0.1:2233/delta?url=https://auth.platorelay.com/a?d=<ticket>"
 | `key` | 求解成功的 key；失败为 `null` |
 | `cached` | `true` = 命中 24h 缓存，直接返回，未重新求解 |
 | `error` | 失败原因，成功为 `null` |
-| `times` | **真实求解耗时**，缓存命中时返回当初求解的耗时 |
+| `times` | **真实求解耗时**，不是请求时间 缓存命中时返回当初求解的耗时 |
 
 可能的 `error` 值：
 
@@ -153,6 +163,7 @@ curl "http://127.0.0.1:2233/delta?url=https://auth.platorelay.com/a?d=<ticket>"
 |-------|------|
 | `invalid url` | URL 解析失败 |
 | `invalid url (no ticket)` | URL 中没有 `d=` 参数 |
+| `无效链接: <上游原因>` | ticket 无效或已过期，上游metadata明确拒绝（如 `invalid payload.`）。此类失败不重试 |
 | `solve failed` | 两次求解均未拿到 key（已含一次自动重试） |
 | `solve exception: XxxError` | 求解过程抛出异常 |
 
@@ -169,6 +180,9 @@ curl "http://127.0.0.1:2233/delta?url=https://auth.platorelay.com/a?d=<ticket>"
 **限流规避**
 服务端对同一链路的相邻 checkpoint 提交有最小间隔要求（实测 ~5s，低于此值返回 `finishing checkpoints too fast`）。求解器按上次提交的真实时间差主动补齐间隔——间隔已足够则不等待，不足才精确补齐。
 
+**无效链接拦截**
+第一轮metadata若明确返回ticket无效/已过期（`invalid payload` / `expired` / `not found` 等）直接返回错误
+
 ---
 
 ## 求解流程
@@ -177,7 +191,11 @@ curl "http://127.0.0.1:2233/delta?url=https://auth.platorelay.com/a?d=<ticket>"
 ticket → 获取 metadata → 求解 captcha → 推进 step → 解码回调 → 下一张 ticket → ... → 获取 key
 ```
 
-每轮自动从 metadata 获取 service 参数，captcha 与 metadata 并行获取以减少耗时；相邻 checkpoint 主动补齐最小间隔以规避服务端限流。
+关键行为：
+
+- **metadata / status / captcha 并行** —— 验证码的等待窗口内顺带完成 metadata（含service、checkpointCount、有效性判定）与status查询
+- **step/poll 重叠** —— 最后一步的step发出后50ms即开始并发轮询key 压掉一个往返
+- **轮数动态** —— 由 metadata 的 `checkpointCount` 决定，不硬编码。
 
 ---
 
@@ -186,9 +204,23 @@ ticket → 获取 metadata → 求解 captcha → 推进 step → 解码回调 �
 ### 鉴权
 
 > **`/delta` 没有任何认证。** 任何能访问该端口的人都能消耗你的求解能力。
-> 生产环境不要直接暴露到公网，至少加上这一项：
+> 生产环境不要直接暴露到公网，至少加上其中一项：
 
-仅监听本地、由上层服务转发：
+Nginx 加 Basic Auth + 限速：
+
+```nginx
+limit_req_zone $binary_remote_addr zone=delta:10m rate=10r/s;
+
+location /delta {
+    limit_req zone=delta burst=20 nodelay;
+    auth_basic "delta";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+    proxy_pass http://127.0.0.1:2233;
+    proxy_read_timeout 120s;
+}
+```
+
+或仅监听本地、由上层服务转发：
 
 ```bash
 python server.py --host 127.0.0.1 --port 2233
@@ -212,15 +244,19 @@ python server.py --host 127.0.0.1 --port 2233
 
 | 项 | 数值 |
 |---|---|
-| 单条求解 | ~8s（其中约 5s 是服务端强制的 checkpoint 间隔） |
-| 验证码识别 | ~290ms/张 |
+| 单条求解 | **~6.8s**（其中 5.0s 是上游强制的 checkpoint 间隔） |
+| └ 非等待部分 | **~1.7s**（物理下限约 1.15s） |
+| 无效链接拦截 | ~1.2s |
+| 验证码识别 | ~80ms/张（numba 预热后） |
 | 识别命中率 | 100%（520 张真实样本，服务端判定） |
 | 缓存命中响应 | 4.4ms（单请求） |
 | 缓存命中吞吐 | 3000 并发全部成功，峰值 ~900 req/s |
 | 多票并发 | 3.5× 吞吐（限流 per-ticket，等待可重叠） |
+| 稳定性 | 串行 10 次 + 同链接并发 4×6 轮，16/16 成功，无慢例 |
 
-单条求解的 8s 中约 5s 是服务端硬性限制，无法压缩；余下为验证码计算与网络往返。吞吐提升靠并发。
+非等待耗时受 **6 次串行网络往返**约束（keep-alive 复用后单次约 0.17s）：`/challenge` → 下载图片 → `/answer` → step1 →（5s）→ step2 → 查 key。到上游的 TCP 握手仅 4ms、TCP+TLS 约 0.09s，网络本身很快，瓶颈在往返次数。
 
+> 首次求解会包含numba JIT编译开销（约 +2s）
 ---
 
 ## 依赖
@@ -239,14 +275,26 @@ python server.py --host 127.0.0.1 --port 2233
 
 | 文件 | 作用 |
 |------|------|
-| `server.py` | HTTP API：缓存、同链接合并|
+| `server.py` | HTTP API：缓存、同链接多请求合并 |
 | `main.py` | 求解链路：验证码 → step → 回调解码 → 轮询 key |
 | `captcha_solver.py` | 验证码识别 |
-| `auth_client.py` | auth 服务客户端：AES-CTR、连接池、UA 池 |
+| `auth_client.py` | auth 服务客户端：AES-CTR、连接池、UA 池、重试 |
 | `link_generator.py` | 生成测试链接 |
 | `requirements.txt` | Python 依赖 |
 
 运行时生成：`.key_cache.json`（key 缓存，可安全删除）。
+
+### 可调参数（`main.py` 顶部）
+
+| 常量 | 默认 | 说明 |
+|------|------|------|
+| `MIN_STEP_GAP` | `5.0` | 相邻 step 最小间隔。**上游硬性要求，不可下调**（低于约 4.5s 必触发限流） |
+| `POLL_MAX_ATTEMPTS` | `10` | `about:blank` 后轮询 key 的次数 |
+| `POLL_INTERVAL` | `0.1` | 轮询间隔（秒），命中即返回 |
+| `POLL_OVERLAP_DELAY` | `0.05` | step发出后多久开始并发轮询（step/poll重叠） |
+| `CAPTCHA_MAX_RETRIES` | `1` | 验证码识别失败重试次数 |
+| `STEP_THROTTLE_RETRIES` | `2` | 遇限流时的重试次数 |
+| `MAX_ROUNDS_HARD_CAP` | `12` | 
 
 ---
 
@@ -254,7 +302,9 @@ python server.py --host 127.0.0.1 --port 2233
 
 | 现象 | 排查方向 |
 |------|----------|
+| `无效链接: invalid payload.` | ticket 无效或已过期，换一条新链接。这是上游明确拒绝，不是本地 bug |
 | `solve failed` | 看 CLI verbose 输出的结束行 `未获取到 key (原因: ...)`，原因为 `captcha-failed` / `step-failed` / `poll-timeout` 等 |
+| 偶发耗时 12s 左右 | 若已部署仍出现此情况，检查 `auth_client.py` 的 `do_step` 重试次数；也可能是上游限流退避叠加 |
 | 大量 `finishing checkpoints too fast` | 检查 `main.py` 的 `MIN_STEP_GAP`（默认 5.0），服务端策略变更时需上调 |
 | 高并发下连接失败 | fd 上限不足，确认 systemd `LimitNOFILE=65535` |
 | 返回已失效的 key | 确认 `.key_cache.json` 的 TTL 逻辑生效；必要时删除该文件重建 |

@@ -6,8 +6,12 @@ urllib3>=1.26
 pycryptodome>=3.15
 fake-useragent>=1.5
 numba>=0.56
+
+# --- HTTP API ---
 fastapi>=0.100
 uvicorn>=0.23
+
+# --- 可选性能加速：缺失自动降级，不影响功能 ---
 uvloop>=0.19; sys_platform != "win32"
 httptools>=0.6
 orjson>=3.9

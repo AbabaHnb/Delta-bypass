@@ -7,11 +7,12 @@ import os
 import time
 import json
 import argparse
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 import captcha_solver as CS
 import auth_client as AUTH
@@ -21,9 +22,9 @@ CAPTCHA_MAX_RETRIES = 1
 FALLBACK_SERVICES = [3]
 MAX_ROUNDS = 3
 MAX_ROUNDS_HARD_CAP = 12     # 12 轮，防死循环
-INTER_ROUND_SLEEP = 0.0      # 已被 MIN_STEP_GAP 取代
-POLL_MAX_ATTEMPTS = 20       # about:blank 后轮询 key 的次数
-POLL_INTERVAL = 0.3          # 每次轮询间隔(秒)
+POLL_MAX_ATTEMPTS = 10       # about:blank 后轮询 key 的次数
+POLL_INTERVAL = 0.1          # 每次轮询间隔(秒)
+POLL_OVERLAP_DELAY = 0.05    # step 发出后多久开始并发轮询 key(重叠掉一个 RTT)
 STEP_THROTTLE_RETRIES = 2    # 遇到限流时重试次数
 STEP_THROTTLE_SLEEP = 2.0    # 限流退避休眠(秒)
 MIN_STEP_GAP = 5.0           # 相邻两次 step 的最小间隔(秒)
@@ -34,23 +35,24 @@ class Timer:
     # 累计各阶段耗时
     def __init__(self):
         self.phases = {}  # 阶段名 -> 总秒数
-        self._t0 = None
-        self._current_phase = None
+        self.t0 = None
+        self.current_phase = None
+        self.invalid_reason = None   # 若求解因"无效/过期链接"终止,记录上游原因
 
     def start(self, phase):
         # 开始计时一个阶段
-        if self._current_phase is not None:
+        if self.current_phase is not None:
             self.stop()
-        self._current_phase = phase
-        self._t0 = time.time()
+        self.current_phase = phase
+        self.t0 = time.time()
 
     def stop(self):
         # 停止当前阶段计时
-        if self._current_phase is not None and self._t0 is not None:
-            dt = time.time() - self._t0
-            self.phases[self._current_phase] = self.phases.get(self._current_phase, 0.0) + dt
-            self._current_phase = None
-            self._t0 = None
+        if self.current_phase is not None and self.t0 is not None:
+            dt = time.time() - self.t0
+            self.phases[self.current_phase] = self.phases.get(self.current_phase, 0.0) + dt
+            self.current_phase = None
+            self.t0 = None
 
     def add(self, name, seconds):
         # 直接添加耗时
@@ -71,10 +73,35 @@ class Timer:
 
 
 #验证码
+# warm session 复用:每次新建 session 都要重新 TLS 握手(实测多 ~0.17s)。
+# 模块级复用一个 session,连接 keep-alive;出错时自动重建。
+captcha_sess = None
+captcha_sess_lock = __import__('threading').Lock()
+
+
+def get_captcha_session():
+    global captcha_sess
+    with captcha_sess_lock:
+        if captcha_sess is None:
+            captcha_sess = CS.session()
+        return captcha_sess
+
+
+def reset_captcha_session():
+    global captcha_sess
+    with captcha_sess_lock:
+        try:
+            if captcha_sess is not None:
+                captcha_sess.close()
+        except Exception:
+            pass
+        captcha_sess = None
+
+
 def get_captcha_token(session=None, verbose=True, timer=None):
     #获取验证码token
     if session is None:
-        session = CS.session()
+        session = get_captcha_session()
 
     if timer:
         timer.start('captcha')
@@ -106,7 +133,7 @@ def get_captcha_token(session=None, verbose=True, timer=None):
 
             if r.get('success'):
                 token = r['token']
-                sel = CS._V8_DEBUG.get('selected', '')
+                sel = CS.V8_DEBUG.get('selected', '')
                 strat = sel[0] if isinstance(sel, tuple) and sel else ''
                 if timer:
                     timer.stop()
@@ -121,6 +148,8 @@ def get_captcha_token(session=None, verbose=True, timer=None):
         except Exception as e:
             if verbose:
                 print(f'  [captcha] 错误: {e}', flush=True)
+            # 连接层异常时重置 warm session,下次重新握手
+            reset_captcha_session()
 
     if timer:
         timer.stop()
@@ -130,10 +159,25 @@ def get_captcha_token(session=None, verbose=True, timer=None):
 #Metadata->Service解析
 def resolve_service(ticket, session=None, verbose=True):
     #从metadata获取service及checkpointCount（决定需要多少轮/步），返回 (service, checkpointCount)
+    svc, cp, valid, reason = resolve_meta(ticket, session=session, verbose=verbose)
+    return svc, cp
+
+
+def resolve_meta(ticket, session=None, verbose=True):
+    """一次 metadata 调用同时得到 (service, checkpointCount, valid, invalid_reason)
+    """
     cp = None
     try:
         meta = AUTH.get_session_metadata(ticket, session=session)
         if isinstance(meta, dict):
+            # 明确的无效/过期判定
+            if meta.get('success') is False and not meta.get('transient'):
+                msg = str(meta.get('message') or meta.get('error') or '').lower()
+                if any(m in msg for m in AUTH.INVALID_MARKERS):
+                    reason = str(meta.get('message') or meta.get('error') or 'invalid link')
+                    if verbose:
+                        print(f'  [meta] 无效链接: {reason}', flush=True)
+                    return None, cp, False, reason
             data = meta.get('data', meta)
             if isinstance(data, dict):
                 profile = data.get('activeRevenueProfile', {})
@@ -145,17 +189,17 @@ def resolve_service(ticket, session=None, verbose=True):
                     except (TypeError, ValueError):
                         cp = None
                     if verbose:
-                        dur = profile.get('duration', '?')
+                        dur = data.get('duration', '?')
                         print(f'  [meta] service={svc} checkpointCount={cp} duration={dur}h', flush=True)
-                    return svc, cp
+                    return svc, cp, True, None
     except Exception as e:
         if verbose:
             print(f'  [meta] 获取失败: {e}', flush=True)
-    return None, cp
+    return None, cp, True, None
 
 
 #Step推进
-def _throttled(r):
+def throttled(r):
     # 判断 step 是否被服务器限流（"finishing checkpoints too fast" 等）
     if not isinstance(r, dict):
         return False
@@ -164,9 +208,8 @@ def _throttled(r):
 
 
 def do_step_with_retry(ticket, token, service=None, session=None, verbose=True, timer=None,
-                       gap_state=None):
-    #执行step失败时尝试回退；遇到限流则退避后原地重试
-    # gap_state: 单条求解链私有的 {'ts': float}，用于保证本链相邻 step 的最小间隔。
+                       gap_state=None, overlap_poll=False, poll_session=None):
+    #执行step失败时尝试回退 遇到限流则退避后直接重试
     services_to_try = []
     if service is not None:
         services_to_try.append(service)
@@ -177,7 +220,7 @@ def do_step_with_retry(ticket, token, service=None, session=None, verbose=True, 
     if timer:
         timer.start('step')
 
-    # 主动保证本链相邻 step 的最小间隔，避免触发限流
+    # 主动保证本链相邻step的最小间隔 避免触发限流
     if gap_state is not None and gap_state.get('ts'):
         gap = time.time() - gap_state['ts']
         if gap < MIN_STEP_GAP:
@@ -185,10 +228,34 @@ def do_step_with_retry(ticket, token, service=None, session=None, verbose=True, 
                 print(f'  [step] 距上次 step 仅 {gap:.1f}s，等待 {MIN_STEP_GAP - gap:.1f}s...', flush=True)
             time.sleep(MIN_STEP_GAP - gap)
 
+    overlap_box = {}
+    overlap_thread = None
+
+    def overlap_poll_worker():
+        #step发出后稍等一下再开始轮询,避免过早的无谓请求
+        time.sleep(POLL_OVERLAP_DELAY)
+        sess = poll_session if poll_session is not None else session
+        for _ in range(POLL_MAX_ATTEMPTS):
+            if overlap_box.get('stop'):
+                return
+            try:
+                st = AUTH.get_session_status(ticket, session=sess)
+                data = st.get('data', st) if isinstance(st, dict) else {}
+                k = data.get('key', '')
+                if k and k != 'KEY_NOT_FOUND':
+                    overlap_box['key'] = k
+                    return
+            except Exception:
+                pass
+            time.sleep(POLL_INTERVAL)
+
     for svc in services_to_try:
         for attempt in range(STEP_THROTTLE_RETRIES + 1):
             try:
                 t0 = time.time()
+                if overlap_poll and overlap_thread is None:
+                    overlap_thread = threading.Thread(target=overlap_poll_worker, daemon=True)
+                    overlap_thread.start()
                 r = AUTH.do_step(ticket, token, service=svc, session=session)
                 dt = time.time() - t0
                 if gap_state is not None:
@@ -198,9 +265,8 @@ def do_step_with_retry(ticket, token, service=None, session=None, verbose=True, 
                         timer.stop()
                     if verbose:
                         print(f'  [step] service={svc} -> 成功 ({(dt * 1000):.0f}ms)', flush=True)
-                    return svc, r
-
-                if _throttled(r):
+                    return svc, r, overlap_box
+                if throttled(r):
                     if attempt < STEP_THROTTLE_RETRIES:
                         if verbose:
                             print(f'  [step] service={svc}: 限流，退避 {STEP_THROTTLE_SLEEP}s 后重试'
@@ -218,7 +284,8 @@ def do_step_with_retry(ticket, token, service=None, session=None, verbose=True, 
 
     if timer:
         timer.stop()
-    return None, {'success': False, 'error': 'all services failed'}
+    overlap_box['stop'] = True
+    return None, {'success': False, 'error': 'all services failed'}, overlap_box
 
 
 #Key提取
@@ -263,64 +330,76 @@ def solve_chain(ticket, verbose=True, max_rounds=MAX_ROUNDS, session=None):
     current_ticket = ticket
     current_service = None
     timer = Timer()
-
-    early = check_key_in_response(current_ticket, session=session, verbose=verbose, timer=timer)
-    if early:
-        if verbose:
-            print(f'  [early] 该链接已完成，直接返回已有 KEY', flush=True)
-        return early, timer
-
+    invalid_reason = [None]
     round_cap = max(max_rounds, 1)
     round_idx = 0
     last_exit = ['round-exhausted']
     gap_state = {'ts': 0.0}
+    token = None
 
     while round_idx < round_cap:
         if verbose:
             print(f'  [{round_idx + 1}/{round_cap}]', flush=True)
-
-        # 避免触发服务器限速
-        if round_idx > 0:
-            	time.sleep(INTER_ROUND_SLEEP)
-
-        #并行获取meta和captcha
         if timer:
             timer.start('meta')
         meta_session = AUTH.create_session()
         meta_future = None
+        stat_future = None
         cpc = None
         try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                meta_future = pool.submit(resolve_service, current_ticket, meta_session, verbose)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                meta_future = pool.submit(resolve_meta, current_ticket, meta_session, verbose)
 
-                #同步captcha
-                try:
-                    token = get_captcha_token(session=session, verbose=verbose, timer=timer)
-                except RuntimeError as e:
-                    if verbose:
-                        print(f'  [error] {e}', flush=True)
-                        print(f'  [retry] 新建 session 重试 captcha...', flush=True)
-                    session = AUTH.create_session()
+                if round_idx == 0:
+                    stat_session = AUTH.create_session()
+                    stat_future = pool.submit(check_key_in_response, current_ticket,
+                                              stat_session, verbose, None)
+
+                if token is None:
                     try:
                         token = get_captcha_token(session=session, verbose=verbose, timer=timer)
-                    except RuntimeError as e2:
+                    except RuntimeError as e:
                         if verbose:
-                            print(f'  [error] {e2}', flush=True)
-                        print(f'  [-] 第 {round_idx + 1} round captcha 失败, 跳过', flush=True)
-                        last_exit[0] = 'captcha-failed'
-                        round_idx += 1
-                        continue
-                #收集meta结果 (service, checkpointCount)
+                            print(f'  [error] {e}', flush=True)
+                            print(f'  [retry] 新建 session 重试 captcha...', flush=True)
+                        session = AUTH.create_session()
+                        try:
+                            token = get_captcha_token(session=session, verbose=verbose, timer=timer)
+                        except RuntimeError as e2:
+                            if verbose:
+                                print(f'  [error] {e2}', flush=True)
+                            print(f'  [-] captcha 失败(重试后仍失败), 无法继续', flush=True)
+                            last_exit[0] = 'captcha-failed'
+                            return None, timer
+
+                if stat_future is not None:
+                    try:
+                        early = stat_future.result(timeout=6)
+                    except Exception:
+                        early = None
+                    if early:
+                        if verbose:
+                            print(f'  [early] 该链接已完成，直接返回已有 KEY', flush=True)
+                        return early, timer
+
                 try:
-                    svc_res = meta_future.result(timeout=5)
-                    if svc_res:
-                        current_service, cpc = svc_res
-                    else:
-                        current_service, cpc = None, None
+                    svc, cpc, mvalid, mreason = meta_future.result(timeout=6)
+                    current_service = svc
+                    if not mvalid:
+                        # 明确无效/过期链接
+                        invalid_reason[0] = mreason
+                        last_exit[0] = 'invalid-link'
+                        timer.invalid_reason = mreason
+                        return None, timer
                 except Exception:
                     current_service, cpc = None, None
         finally:
             meta_session.close()
+            try:
+                if stat_future is not None:
+                    stat_session.close()
+            except Exception:
+                pass
         if timer:
             timer.stop()
 
@@ -335,14 +414,22 @@ def solve_chain(ticket, verbose=True, max_rounds=MAX_ROUNDS, session=None):
         if current_service is not None and verbose:
             print(f'  [service] metadata: {current_service}', flush=True)
 
-        service, resp = do_step_with_retry(
+        # 对最后一步开启step/poll 重叠 两个串行RTT压成一个
+        last_step = round_idx > 0
+        service, resp, overlap = do_step_with_retry(
             current_ticket, token,
             service=current_service,
             session=session,
             verbose=verbose,
             timer=timer,
-            gap_state=gap_state
+            gap_state=gap_state,
+            overlap_poll=last_step,
+            poll_session=None
         )
+        if overlap.get('key'):
+            if verbose:
+                print(f'  [key] 发现 KEY (重叠轮询): {overlap["key"]}', flush=True)
+            return overlap['key'], timer
         if service is None:
             if verbose:
                 print(f'  [-] 第 {round_idx + 1} round step 全部失败, 跳过', flush=True)
