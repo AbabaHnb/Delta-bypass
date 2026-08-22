@@ -11,11 +11,16 @@ import urllib3
 from Crypto.Cipher import AES as AES
 from fake_useragent import UserAgent
 
-ua = UserAgent(platforms='mobile')
 AUTH_API = "https://auth.platorelay.com/api"
 
-# fake_useragent 的 .random 每次约 16ms（内部重新筛选数据集），在高并发下是显著开销。
-# 启动时预生成一批 UA，之后 O(1) 轮转取用 —— 对外表现（UA 多样性）不变。
+
+UA_SOURCES = (
+    UserAgent(browsers=['Mobile Safari'], platforms='mobile'),
+    UserAgent(browsers=['Chrome Mobile'], platforms='mobile', min_version=100.0),
+)
+
+# fake_useragent 每次取用约 16ms(内部重新筛选数据集),高并发下是显著开销:
+# 启动时预生成一批,之后 O(1) 轮转取用 —— 对外表现(UA 多样性)不变。
 UA_POOL = []
 UA_IDX = itertools.count()
 UA_SCREEN = {}
@@ -24,11 +29,11 @@ SCREENS_IPHONE = ('390x844', '393x852', '375x812', '414x896', '430x932', '428x92
 SCREENS_IPAD = ('820x1180', '834x1194', '768x1024', '744x1133', '1024x1366')
 SCREENS_ANDROID = ('360x800', '412x915', '393x873', '384x854', '360x780', '412x892', '432x960')
 
-FALLBACK_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
+FALLBACK_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) '
+               'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Mobile/15E148 Safari/604.1')
 
 
 def screens_for(platform, os_name):
-    #依据 fake_useragent 的 platform/os 字段选择该机型的分辨率候选
     p = (platform or '').lower()
     o = (os_name or '').lower()
     if 'ipad' in p or 'tablet' in p:
@@ -39,22 +44,28 @@ def screens_for(platform, os_name):
 
 
 def build_ua_pool(size=32):
-    #预生成 UA 池
+    #预生成 UA 池:从各来源均匀取用,并为每个 UA 绑定一个匹配其平台的屏幕分辨率
     pool = []
-    for _ in range(size):
-        try:
-            rec = ua.getRandom
-        except Exception:
-            break
-        if not isinstance(rec, dict):
-            break
-        s = rec.get('useragent')
-        if not s or s in UA_SCREEN:
-            continue
-        cands = screens_for(rec.get('platform'), rec.get('os'))
-        # 用 UA 字符串哈希取模,保证同一 UA 恒定拿到同一分辨率
-        UA_SCREEN[s] = cands[hash(s) % len(cands)]
-        pool.append(s)
+    per = max(1, size // len(UA_SOURCES))
+    for src in UA_SOURCES:
+        got = 0
+        tried = 0
+        while got < per and tried < per * 8:
+            tried += 1
+            try:
+                rec = src.getRandom
+            except Exception:
+                break
+            if not isinstance(rec, dict):
+                break
+            s = rec.get('useragent')
+            if not s or s in UA_SCREEN:
+                continue
+            cands = screens_for(rec.get('platform'), rec.get('os'))
+            # 用 UA 字符串哈希取模,保证同一 UA 恒定拿到同一分辨率
+            UA_SCREEN[s] = cands[hash(s) % len(cands)]
+            pool.append(s)
+            got += 1
     if not pool:
         pool = [FALLBACK_UA]
         UA_SCREEN.setdefault(FALLBACK_UA, SCREENS_IPHONE[0])
@@ -107,6 +118,9 @@ def aes_ctr_encrypt(plaintext, key_bytes, iv_bytes):
 
 def build_meta_stream(ticket, now_ms=None, user_agent=None, screen=None):
     #从ticket构建AES-CTR字段
+    # user_agent: 加密体内声明的 UA。应与本次请求 HTTP 头的 User-Agent 保持一致,
+    #   否则"头里是随机某机型、体内固定写死另一机型"会形成自相矛盾的指纹。
+    # screen: 屏幕尺寸,默认按 UA 平台自动挑一个匹配值。
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     if user_agent is None:
@@ -232,7 +246,7 @@ def do_step(ticket, token, service=3, session=None, now_ms=None):
     }).encode()
 
     STEP_HTTP_RETRIES = 3        
-    STEP_RETRY_SLEEP = 0.25      
+    STEP_RETRY_SLEEP = 0.5      
     last_err = None
     for attempt in range(STEP_HTTP_RETRIES + 1):
         try:
@@ -250,7 +264,6 @@ def do_step(ticket, token, service=3, session=None, now_ms=None):
             try:
                 return json.loads(r.data)
             except Exception:
-                # 200 但响应体不是 JSON
                 last_err = "non-json response"
                 if attempt < STEP_HTTP_RETRIES:
                     time.sleep(STEP_RETRY_SLEEP)
@@ -304,6 +317,7 @@ def get_session_metadata(ticket, session=None):
     # GET /api/session/metadata
     return get_json(f"session/metadata?ticket={urllib.parse.quote(ticket)}")
 
+
 INVALID_MARKERS = ('invalid payload', 'expired', 'not found', 'invalid session',
                      'invalid ticket', 'does not exist')
 
@@ -323,6 +337,5 @@ def check_ticket_valid(ticket, session=None):
         msg = str(meta.get('message') or meta.get('error') or '').lower()
         if any(m in msg for m in INVALID_MARKERS):
             return False, str(meta.get('message') or meta.get('error') or 'invalid link')
-        # 其它未知失败
         return True, None
     return True, None

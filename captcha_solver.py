@@ -12,27 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numba
 from numba import njit, prange
-from fake_useragent import UserAgent
 
-ua = UserAgent(platforms='mobile')
-
-# fake_useragent 的 .random 每次约 16ms，高并发下是显著开销：启动时预生成后轮转取用
-import itertools as it
-UA_POOL = []
-UA_IDX = it.count()
-
-
-def rand_ua():
-    global UA_POOL
-    if not UA_POOL:
-        seen = []
-        for _ in range(32):
-            try:
-                seen.append(ua.random)
-            except Exception:
-                break
-        UA_POOL = list(dict.fromkeys(seen)) or ['Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)']
-    return UA_POOL[next(UA_IDX) % len(UA_POOL)]
+# UA 池:复用auth_client的池,避免两处各自维护一份筛选规则
+from auth_client import rand_ua
 
 API = "https://captcha.platorelay.com/api"
 V8_DEBUG = {}
